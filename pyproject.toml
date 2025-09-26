@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "e8-kaleidoscope-ai"
+version = "0.0.0"
+description = "E8 mind kernel with memory graph, vector index, LLM gateway, telemetry, and SDI persistence"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "numpy",
+    "scipy",
+    "torch",
+    "networkx",
+    "scikit-learn",
+    "aiohttp",
+    "aiohttp-cors",
+    "rich",
+    "pyyaml",
+    "websockets",
+    "unidecode",
+]
+
+[project.optional-dependencies]
+providers = [
+    "openai",
+    "ollama",
+    "google-generativeai",
+]
+physics = [
+    "clifford",
+    "numba",
+]
+faiss = [
+    "faiss-cpu",
+]
+dev = [
+    "pytest",
+    "ruff",
+    "mypy",
+]
+
+[tool.setuptools]
+packages = []
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = [
+    "e8_mind_server_M24.py",
+    "runtime/",
+    "static/",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]

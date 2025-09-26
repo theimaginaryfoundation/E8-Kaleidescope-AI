@@ -59,3 +59,9 @@ Thumbs.db
 
 # Runtime data (exclude entire runtime directory to avoid large files)
 runtime/
+
+# Backlog (local, untracked prompts)
+prompts/backlog/
+
+# Tooling caches
+.ruff_cache/
