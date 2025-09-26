@@ -18,6 +18,7 @@ for _alias in _LEGACY_MODULE_ALIASES:
 
 import asyncio
 from core.config import AppConfig # Import AppConfig to access VALIDATOR_WRITEBACK_ENABLED
+from core import sdi
 
 class _TaskSlot:
     """Single-concurrency task slot with dedup + exception logging.
@@ -14281,6 +14282,44 @@ class MemoryManager(GeometryHygieneMixin):
             except Exception:
                 pass
             self.main_vectors[node_id] = vec
+            # SDI capsule + commit logging (early path)
+            try:
+                vec_bytes = np.asarray(vec, dtype=np.float32).tobytes()
+                emb_digest = hashlib.sha256(vec_bytes).hexdigest()
+            except Exception:
+                emb_digest = ""
+            try:
+                capsule = sdi.Capsule(
+                    node_id=node_id,
+                    capsule_type=entry_data.get('type', 'unknown'),
+                    label=entry_data.get('label', ''),
+                    body=entry_data.get('metaphor'),
+                    created_step=int(getattr(self.mind, 'step_num', 0)),
+                    parents=list(parent_ids or []),
+                    model_info={
+                        'provider': getattr(self.mind, 'llm_provider', os.getenv('E8_PROVIDER', 'stub')),
+                        'model': getattr(self.mind, 'client_model', None),
+                        'embedding_model': getattr(self.mind, 'embedding_model', None),
+                        'embedding_in_dim': int(getattr(self.mind, 'embed_in_dim', EMBED_DIM)),
+                        'embedding_out_dim': int(EMBED_DIM),
+                        'placeholder': bool(getattr(self.mind, 'is_embed_placeholder', False)),
+                    },
+                    embedding_digest_sha256=emb_digest,
+                )
+                capsule = sdi.append_capsule(self.run_id, capsule)
+                if capsule.cid:
+                    head_cid = sdi.get_branch_head(self.run_id)
+                    commit = sdi.Commit(
+                        capsules=[capsule.cid],
+                        parent=head_cid,
+                        created_step=int(getattr(self.mind, 'step_num', 0)),
+                    )
+                    sdi.append_commit(self.run_id, commit)
+            except Exception as sdi_err:
+                try:
+                    self.console.log(f"[SDI] capsule persistence failed: {sdi_err}")
+                except Exception:
+                    pass
             # add to holo index if available (boundary-local structure)
             try:
                 if getattr(self, 'holo_index', None) is not None:
@@ -14485,29 +14524,38 @@ class MemoryManager(GeometryHygieneMixin):
             return s[:cut] + "..."
 
         safe_label = _ellipsize(label, 80)
-        try:
-            panel = Panel(
-                f"[bold white]{entry_type.upper()}[/] accepted: [bold cyan]'{safe_label}'[/]\n"
-                f"[dim]ID: {node_id[:8]} • Rating: {rating:.2f}[/]",
-                title="[bold green]✓ ACCEPTANCE[/]",
-                border_style="dark_green"
-            )
-            # If console_lock exists and is not async, use it. Otherwise print directly.
-            lock = getattr(self.mind, 'console_lock', None)
+        quiet_mode = bool(getattr(self.mind, 'quiet', False))
+
+        if quiet_mode:
+            summary = f"[acceptance quiet] {entry_type.upper()} '{safe_label}' id:{node_id[:8]} rating:{rating:.2f}"
             try:
-                if lock is not None and hasattr(lock, 'acquire') and not asyncio.iscoroutinefunction(getattr(lock, '__aenter__', None)):
-                    with lock:
-                        self.console.print(panel)
-                else:
-                    self.console.print(panel)
-            except Exception:
-                self.console.print(panel)
-        except Exception:
-            # Fallback to simple log if Rich Panel fails
-            try:
-                self.console.log(f"[ACCEPTANCE] {entry_type.upper()} accepted: '{safe_label}' (id:{node_id[:8]}, rating:{rating:.2f})")
+                self.console.log(summary)
             except Exception:
                 pass
+        else:
+            try:
+                panel = Panel(
+                    f"[bold white]{entry_type.upper()}[/] accepted: [bold cyan]'{safe_label}'[/]\n"
+                    f"[dim]ID: {node_id[:8]} • Rating: {rating:.2f}[/]",
+                    title="[bold green]✓ ACCEPTANCE[/]",
+                    border_style="dark_green"
+                )
+                # If console_lock exists and is not async, use it. Otherwise print directly.
+                lock = getattr(self.mind, 'console_lock', None)
+                try:
+                    if lock is not None and hasattr(lock, 'acquire') and not asyncio.iscoroutinefunction(getattr(lock, '__aenter__', None)):
+                        with lock:
+                            self.console.print(panel)
+                    else:
+                        self.console.print(panel)
+                except Exception:
+                    self.console.print(panel)
+            except Exception:
+                # Fallback to simple log if Rich Panel fails
+                try:
+                    self.console.log(f"[ACCEPTANCE] {entry_type.upper()} accepted: '{safe_label}' (id:{node_id[:8]}, rating:{rating:.2f})")
+                except Exception:
+                    pass
 
         # Journey Logger: Track insight/memory creation with unified context
         try:
@@ -14541,194 +14589,7 @@ class MemoryManager(GeometryHygieneMixin):
             pass
 
         return node_id
-        entry_data.setdefault("age", 0)
-        entry_data["last_step"] = self.mind.step_num
-        entry_data["mood_context"] = self.mood.mood_vector.copy()
-        # Seed connectivity_potential from rating.
-        # Modes controlled by env E8_POTENTIAL_MAPPING: 'linear' (default) or 'sigmoid'.
-        # Linear: 0.5 + 0.6*(r-0.5) (expands around 0.5 by Â±0.3)
-        # Sigmoid: maps rating through configurable logistic curve for smoother tails.
-        r = float(entry_data.get("rating", 0.5))
-        mapping_mode = os.getenv("E8_POTENTIAL_MAPPING", "linear").lower()
-        if mapping_mode == "sigmoid":
-            # Parameters (env override): center, gain, spread
-            # center ~ midpoint rating; gain ~ slope; spread scales output amplitude around 0.5
-            c = float(os.getenv("E8_POTENTIAL_SIGMOID_CENTER", "0.5"))
-            g = float(os.getenv("E8_POTENTIAL_SIGMOID_GAIN", "8.0"))  # higher -> steeper transition
-            spread = float(os.getenv("E8_POTENTIAL_SIGMOID_SPREAD", "0.85"))  # max deviation from 0.5 (<=1)
-            # Logistic value in (0,1)
-            sig = 1.0 / (1.0 + math.exp(-g * (r - c)))
-            # Recenter so midpoint maps to 0.5 and scale by spread
-            pot = 0.5 + spread * (sig - 0.5)
-            entry_data["connectivity_potential"] = float(np.clip(pot, 0.0, 1.0))
-        else:
-            entry_data["connectivity_potential"] = float(np.clip(0.5 + 0.6 * (r - 0.5), 0.0, 1.0))
-        try:
-            self._assert_writer()
-        except Exception:
-            pass
-        self.graph_db.add_node(node_id, **entry_data)
-        try:
-            self._assert_writer()
-        except Exception:
-            pass
-        self.main_vectors[node_id] = vec
-        if entry_data.get('label'):
-            self.label_to_node_id[entry_data['label']] = node_id
 
-        try:
-            for shell_dim in [8, 16, 32, 64]:
-                shell = self.mind.dimensional_shells.get(shell_dim)
-                if shell is None:
-                    continue
-                v = np.asarray(vec, dtype=np.float32)
-                if getattr(v, 'ndim', 1) == 1:
-                    shell.add_vector(node_id, v)
-        except Exception as _e:
-            try:
-                self.console.log(f"[MemoryManager] shell.add_vector guarded failure: {_e}")
-            except Exception:
-                pass
-        
-        try:
-            # Only validate high-value, generated insights, not all incoming data.
-            insight_types_to_validate = {"insight_synthesis", "explorer_insight", "meta_reflection"}
-            # Use centralized config for auto-validation
-            config = AppConfig.from_env()
-            if (config.auto_validate_insights and 
-                    entry_data.get("type") in insight_types_to_validate):
-                # Route through unified helper which handles gating and rating thresholds
-                try:
-                    self.mind._maybe_validate_new_insight(
-                        node_id,
-                        kind=entry_data.get("type", "insight"),
-                        rating=entry_data.get("rating")
-                    )
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        if parent_ids:
-            for parent_id in parent_ids:
-                if self.graph_db.get_node(parent_id):
-                    self.graph_db.add_edge(node_id, parent_id, type="reflection_source", weight=0.9)
-        
-        self.pending_additions.append((node_id, vec))
-        if len(self.pending_additions) >= self.KDTREE_REBUILD_THRESHOLD:
-            self._commit_pending_additions_locked()
-
-        self.sdm.write(vec)
-        self.mood.process_event("new_concept", rating=entry_data.get("rating", 0.5))
-        if entry_data.get("label"):
-            try:
-                # schedule async tracking without awaiting (we're in sync context)
-                try:
-                    asyncio.create_task(self.subconscious.track_concept(entry_data["label"], weight=entry_data.get("rating", 0.5)))
-                except Exception:
-                    # fallback: run in new loop briefly
-                    try:
-                        asyncio.run(self.subconscious.track_concept(entry_data["label"], weight=entry_data.get("rating", 0.5)))
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-
-        # perform_retro_relink already scheduled above while the memory lock was held.
-        # Avoid scheduling or calling it again here to ensure graph mutations
-        # occur under the memory manager's lock/EHS-authorized context.
-        
-        # Tetra Broadcasting for E8 Visualization
-        try:
-            # Register tetra for E8-to-3D projection
-            tetra_data = self.mind.e8_register_point(vec, node_id)
-            
-            # Add additional metadata for broadcasting
-            tetra_data.update({
-                "type": entry_data.get('type', 'concept'),
-                "label": entry_data.get('label', ''),
-                "metaphor": entry_data.get('metaphor', ''),
-                "rating": entry_data.get('rating', 0.5),
-                "temperature": entry_data.get('temperature', 1.0),
-                "age": entry_data.get('age', 0),
-                "last_step": entry_data.get('last_step', 0),
-                "mood_context": entry_data.get('mood_context', []),
-                "embedding": vec.tolist() if hasattr(vec, 'tolist') else list(vec),
-                "vec8D": (vec.tolist()[:8] if hasattr(vec, 'tolist') else list(vec)[:8])
-            })
-            
-            # Broadcast tetra to frontend via SSE
-            if hasattr(self.mind, 'sse_clients') and self.mind.sse_clients:
-                tetra_payload = json.dumps({
-                    "type": "tetra_update",
-                    "data": tetra_data
-                }, cls=NumpyEncoder, ensure_ascii=False)
-                
-                dead_clients = set()
-                for q in list(self.mind.sse_clients):
-                    try:
-                        q.put_nowait(tetra_payload)
-                    except asyncio.QueueFull:
-                        dead_clients.add(q)
-                
-                # Clean up dead clients
-                for q in dead_clients:
-                    self.mind.sse_clients.discard(q)
-                # Mirror to WS clients
-                try:
-                    if hasattr(self.mind, '_schedule_async_task'):
-                        self.mind._schedule_async_task(self.mind._ws_broadcast_text(tetra_payload))
-                    else:
-                        asyncio.create_task(self.mind._ws_broadcast_text(tetra_payload))
-                except Exception:
-                    pass
-            
-        except Exception as e:
-            # Log error but don't fail the entry addition
-            try:
-                self.console.log(f"[TETRA] Error broadcasting tetra for {node_id}: {e}")
-            except Exception:
-                pass
-        
-        # Add acceptance log for verification
-        entry_type = entry_data.get('type', 'unknown')
-        label = entry_data.get('label', 'N/A')
-        rating = entry_data.get('rating', 0.5)
-        
-        # Rich Panel formatting for acceptance messages
-        try:
-            # Synchronous-safe console printing. If a synchronous lock exists, use it.
-            lock = getattr(self.mind, 'console_lock', None)
-            try:
-                if lock is not None and hasattr(lock, 'acquire') and not asyncio.iscoroutinefunction(getattr(lock, '__aenter__', None)):
-                    with lock:
-                        self.console.print(Panel(
-                            f"[bold white]{entry_type.upper()}[/] accepted: [bold cyan]'{label}'[/]\n"
-                            f"[dim]ID: {node_id[:8]} â€¢ Rating: {rating:.2f}[/]",
-                            title="[bold green]âœ“ ACCEPTANCE[/]",
-                            border_style="dark_green"
-                        ))
-                else:
-                    # Lock not suitable for sync context; just print
-                    self.console.print(Panel(
-                        f"[bold white]{entry_type.upper()}[/] accepted: [bold cyan]'{label}'[/]\n"
-                        f"[dim]ID: {node_id[:8]} â€¢ Rating: {rating:.2f}[/]",
-                        title="[bold green]âœ“ ACCEPTANCE[/]",
-                        border_style="dark_green"
-                    ))
-            except Exception:
-                # If printing with Panel fails, fall back to logging
-                try:
-                    self.console.log(f"[ACCEPTANCE] {entry_type.upper()} accepted: '{label}' (id:{node_id[:8]}, rating:{rating:.2f})")
-                except Exception:
-                    pass
-        except Exception:
-            try:
-                self.console.log(f"[ACCEPTANCE] {entry_type.upper()} accepted: '{label}' (id:{node_id[:8]}, rating:{rating:.2f})")
-            except Exception:
-                pass
-        
-        return node_id
 
     def _commit_pending_additions_locked(self):
         if not self.pending_additions:
@@ -20408,6 +20269,13 @@ class E8Mind:
             content: Body text (rich markup allowed)
             style: border/title color name or hex (e.g., "magenta", "#5F9EA0")
         """
+        if getattr(self, 'quiet', False):
+            try:
+                summary = sanitize_line(content, 160)
+                self.console.log(f"[panel quiet] {title}: {summary}")
+            except Exception:
+                pass
+            return
         try:
             async with self.console_lock:
                 self.console.print(Panel(
@@ -20425,6 +20293,13 @@ class E8Mind:
 
     def _log_panel_nowait(self, title: str, content: str, style: str = "blue"):
         """Schedule _log_panel without awaiting (safe for sync call sites)."""
+        if getattr(self, 'quiet', False):
+            try:
+                summary = sanitize_line(content, 160)
+                self.console.log(f"[panel quiet] {title}: {summary}")
+            except Exception:
+                pass
+            return
         try:
             loop = asyncio.get_running_loop()
         except Exception:
@@ -21173,6 +21048,15 @@ class E8Mind:
         self.console = console
         self.run_id = run_id
         self.is_embed_placeholder = is_embed_placeholder
+        try:
+            self.llm_provider = globals().get('LLM_PROVIDER', os.getenv('E8_PROVIDER', 'stub'))
+        except Exception:
+            self.llm_provider = os.getenv('E8_PROVIDER', 'stub')
+        try:
+            quiet_val = str(os.getenv('E8_QUIET', '0')).strip().lower()
+            self.quiet = quiet_val in ('1', 'true', 'yes', 'on')
+        except Exception:
+            self.quiet = False
 
         # Initialize Journey Logger for unified tracking
         self.journey_logger = JourneyLogger(
@@ -25076,20 +24960,32 @@ class E8Mind:
                         pass
             # Present final explorer outcome using the same green bordered Panel as other explorer prints
             try:
-                safe_label = escape((self.explorer_last_answer or "Explorer").strip()[:42])
-                async with self.console_lock:
+                base_label = (self.explorer_last_answer or "Explorer").strip()
+                truncated_label = base_label[:42]
+                ellipsis = '…' if len(base_label) > len(truncated_label) else ''
+                safe_label = escape(truncated_label)
+                quiet_label = sanitize_line(truncated_label or "Explorer", max_chars=42)
+
+                if getattr(self, 'quiet', False):
+                    summary = sanitize_line(answer or "", max_chars=120)
                     try:
-                        self.console.print(Panel(
-                            f"[bold white]{sanitize_block(answer, 6, 800)}[/]",
-                            title=f"[bold green]🧭 EXPLORER[/] · {safe_label}{'…' if len(safe_label)>42 else ''}",
-                            border_style="green"
-                        ))
+                        self.console.log(f"[explorer quiet] {quiet_label}: {summary}")
                     except Exception:
-                        # fallback to single-line dimmed log if Panel fails
+                        pass
+                else:
+                    async with self.console_lock:
                         try:
-                            self.console.log(f"[dim][Explorer Final Outcome] {answer}[/dim]")
+                            self.console.print(Panel(
+                                f"[bold white]{sanitize_block(answer, 6, 800)}[/]",
+                                title=f"[bold green]🧭 EXPLORER[/] · {safe_label}{ellipsis}",
+                                border_style="green"
+                            ))
                         except Exception:
-                            self.console.log(f"[Explorer Final Outcome] {answer}")
+                            # fallback to single-line dimmed log if Panel fails
+                            try:
+                                self.console.log(f"[dim][Explorer Final Outcome] {answer}[/dim]")
+                            except Exception:
+                                self.console.log(f"[Explorer Final Outcome] {answer}")
             except Exception:
                 # ensure we never crash on logging the final outcome
                 try:
@@ -25158,6 +25054,12 @@ class E8Mind:
     async def _show_fallback_proximity_alert(self, message: str):
         """Show a fallback proximity alert when normal proximity detection fails."""
         try:
+            if getattr(self, 'quiet', False):
+                try:
+                    self.console.log(f"[RAY ALERT suppressed] {sanitize_line(message, 200)}")
+                except Exception:
+                    pass
+                return
             # Suppress fallback if a successful proximity alert already occurred this step
             if getattr(self, '_last_proximity_success_step', -1) == getattr(self, 'step_num', None):
                 return
@@ -26462,6 +26364,19 @@ class E8Mind:
             }
         except Exception:
             pass
+
+        try:
+            telemetry['sdi'] = {
+                'branch_head': sdi.get_branch_head(self.run_id),
+                'capsules_count': sdi.count_capsules(self.run_id),
+                'commits_count': sdi.count_commits(self.run_id),
+            }
+        except Exception:
+            telemetry['sdi'] = {
+                'branch_head': None,
+                'capsules_count': 0,
+                'commits_count': 0,
+            }
 
         if self.market:
             telemetry["market"] = {"symbols": self.market_symbols, "last": self.market_last}
@@ -29060,6 +28975,68 @@ async def handle_get_metrics_recent(request):
         console.log(f"[Metrics API Error] {e}")
         return web.json_response({"error": "Failed to retrieve recent metrics"}, status=500)
 
+
+async def handle_get_sdi_branch(request):
+    """GET /api/sdi/branch - Return branch head and recent commits."""
+    mind = request.app['mind']
+    try:
+        try:
+            limit = int(request.query.get('limit', '20'))
+        except Exception:
+            limit = 20
+        limit = max(1, min(limit, 100))
+        head = sdi.get_branch_head(mind.run_id)
+        commits = sdi.tail_commits(mind.run_id, limit)
+        return web.json_response({
+            'head': head,
+            'last_commits': commits,
+        })
+    except Exception as err:
+        try:
+            mind.console.log(f"[SDI] branch handler failed: {err}")
+        except Exception:
+            pass
+        return web.json_response({"error": "Failed to load SDI branch"}, status=500)
+
+
+async def handle_get_sdi_commits(request):
+    """GET /api/sdi/commits - Return recent commits for current run."""
+    mind = request.app['mind']
+    try:
+        try:
+            limit = int(request.query.get('limit', '20'))
+        except Exception:
+            limit = 20
+        limit = max(1, min(limit, 200))
+        commits = sdi.tail_commits(mind.run_id, limit)
+        return web.json_response({'commits': commits})
+    except Exception as err:
+        try:
+            mind.console.log(f"[SDI] commits handler failed: {err}")
+        except Exception:
+            pass
+        return web.json_response({"error": "Failed to load SDI commits"}, status=500)
+
+
+async def handle_get_sdi_capsules(request):
+    """GET /api/sdi/capsules - Return recent capsules for current run."""
+    mind = request.app['mind']
+    try:
+        try:
+            limit = int(request.query.get('limit', '20'))
+        except Exception:
+            limit = 20
+        limit = max(1, min(limit, 200))
+        capsules = sdi.tail_capsules(mind.run_id, limit)
+        return web.json_response({'capsules': capsules})
+    except Exception as err:
+        try:
+            mind.console.log(f"[SDI] capsules handler failed: {err}")
+        except Exception:
+            pass
+        return web.json_response({"error": "Failed to load SDI capsules"}, status=500)
+
+
 async def handle_add_concept(request):
     mind = request.app['mind']
     try:
@@ -29266,120 +29243,17 @@ async def main():
     if web is None:
         console.log("[bold yellow]aiohttp not installed. Skipping server startup; core mind initialized headlessly.[/bold yellow]")
         return
-    app = web.Application()
-    # Lightweight CORS middleware to ensure browsers can connect (EventSource/fetch)
-    # This is a minimal fallback if aiohttp_cors is not installed/configured.
-    @web.middleware
-    async def _simple_cors_middleware(request, handler):
-        """Fallback CORS middleware.
-
-        We only inject headers when aiohttp_cors is NOT available. If aiohttp_cors
-        is active it will add the headers itself; adding them twice triggers
-        an assertion inside aiohttp_cors (_on_response_prepare) which expects
-        Access-Control-Allow-Origin to be absent before it runs.
-        """
-        resp = None
-        if aiohttp_cors is None:
-            # Fast path for OPTIONS preflight when no full cors lib
-            if request.method == 'OPTIONS':
-                resp = web.Response(status=204)
-                resp.headers['Access-Control-Allow-Origin'] = '*'
-                resp.headers['Access-Control-Allow-Methods'] = 'GET,POST,OPTIONS'
-                resp.headers['Access-Control-Allow-Headers'] = '*'
-                return resp
-        # Proceed to handler
-        resp = await handler(request)
-        if aiohttp_cors is None:
-            # Only add headers ourselves if aiohttp_cors isn't managing them
-            try:
-                resp.headers.setdefault('Access-Control-Allow-Origin', '*')
-                resp.headers.setdefault('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
-                resp.headers.setdefault('Access-Control-Allow-Headers', '*')
-            except Exception:
-                pass
-        return resp
-
-    # Connection rate limiter to prevent rapid reconnection flooding
-    connection_tracker = {}
-    @web.middleware
-    async def _connection_rate_limiter(request, handler):
-        """Prevent rapid connection attempts from the same IP."""
-        if '/ws' in request.path or '/telemetry' in request.path:
-            client_ip = request.remote or 'unknown'
-            now = time.time()
-            
-            # Clean old entries (older than 30 seconds)
-            to_remove = [ip for ip, last_time in connection_tracker.items() if now - last_time > 30]
-            for ip in to_remove:
-                connection_tracker.pop(ip, None)
-            
-            # Check rate limit (max 1 connection per second per IP)
-            if client_ip in connection_tracker:
-                if now - connection_tracker[client_ip] < 1.0:
-                    console.log(f"[RATE LIMIT] Blocking rapid connection from {client_ip}")
-                    return web.Response(text='Rate limited', status=429)
-            
-            connection_tracker[client_ip] = now
-        
-        return await handler(request)
-
-    # Always register middleware; it becomes a no-op when aiohttp_cors present
-    app.middlewares.append(_simple_cors_middleware)
-    app.middlewares.append(_connection_rate_limiter)
-    app['mind'] = mind
-    app['sse_clients'] = set()
-    mind.sse_clients = app['sse_clients']
-    app['ws_clients'] = set()
-    mind.ws_clients = app['ws_clients']
-    app.on_shutdown.append(shutdown_sse)
-    app.on_shutdown.append(shutdown_market_feed)
-    app.on_shutdown.append(shutdown_ws)
-    # Setup CORS if available; otherwise use a no-op shim
-    if aiohttp_cors is not None:
-        cors = aiohttp_cors.setup(app, defaults={"*": aiohttp_cors.ResourceOptions(allow_credentials=True, expose_headers="*", allow_headers="*")})
-    else:
-        class _NoCors:
-            def __init__(self):
-                pass
-            def add(self, *a, **k):
-                return None
-        cors = _NoCors()
-
-    # Add remaining (non-duplicate) routes
-    app.router.add_get("/api/memory/search", handle_memory_search)
-    app.router.add_get("/api/state", handle_get_state)
-    app.router.add_post("/api/action/dream", handle_trigger_dream)
-    app.router.add_get("/api/qeng/telemetry", handle_get_qeng_telemetry)
-    app.router.add_get("/api/qeng/ablation", handle_get_qeng_ablation)
-    app.router.add_get("/api/qeng/probabilities", handle_get_qeng_probabilities)
-    app.router.add_get("/metrics/summary", handle_get_metrics_summary)
-    app.router.add_get("/metrics/live", handle_get_metrics_live)
-    app.router.add_post("/quantizer", handle_post_quantizer)
-    app.router.add_post("/snapshot", handle_post_snapshot)
-    # Add missing routes for HTML frontend compatibility
-    app.router.add_get("/api/telemetry", handle_get_telemetry)
-    app.router.add_get("/api/blueprint", handle_get_blueprint)
-    app.router.add_get("/api/telemetry/stream", handle_stream_telemetry)
-    # WebSocket endpoints (multiple aliases for frontend probes)
-    app.router.add_get("/api/telemetry/ws", handle_ws_telemetry)
-    app.router.add_get("/ws/telemetry", handle_ws_telemetry)
-    app.router.add_get("/ws", handle_ws_telemetry)
-    app.router.add_get("/api/graph", handle_get_graph)
-    app.router.add_get("/api/graph/summary", handle_get_graph_summary)
-    app.router.add_get("/api/node/{node_id}", handle_get_node)
-    app.router.add_get("/api/bh/panel", handle_get_bh_panel)
-    app.router.add_get("/api/metrics/recent", handle_get_metrics_recent)
-    app.router.add_post("/api/concept/add", handle_add_concept)
-    app.router.add_post("/api/concept", handle_add_concept_legacy)
-    app.router.add_get("/", handle_index)
-
-    static_path = os.path.join(BASE_DIR, 'static')
-    if os.path.exists(static_path):
-        try:
-            app.router.add_static('/', static_path, show_index=True)
-        except Exception:
-            pass
-    for route in list(app.router.routes()): cors.add(route)
+    # Build the HTTP app via modular adapter (no behavior change)
+    try:
+        from e8.api.server import create_app  # type: ignore
+    except Exception:
+        create_app = None  # type: ignore
+    if create_app is None:
+        console.log("[bold yellow]API adapter unavailable; falling back to inline app setup is not supported in this build.[/bold yellow]")
+        return
+    app = create_app(mind, console=console)
+    if app is None:
+        return
 
     runner = web.AppRunner(app)
     await runner.setup()
