@@ -234,6 +234,18 @@ Next:
 
 # Kaleidoscope E8 Mind - Minimal M24 Setup
 
+## Setup with uv
+
+1. `uv sync`
+2. `uv run python scripts/smoke_memory.py` → should print `SMOKE PASS`
+3. Optional extras: `uv sync --extra providers,physics,faiss`
+4. Optional server stub: `uv run python -c "import asyncio, e8_mind_server_M24 as m; asyncio.run(m.main())"`
+
+Use the bundled template to load defaults: `cp .env.example .env && source .env`, then run `uv run python scripts/smoke_memory.py`.
+Full environment reference lives in `docs/env.md`.
+
+> Prefer `uv` for new environments. A `requirements.txt` snapshot remains for short-term compatibility, but the dependency source of truth now lives in `pyproject.toml`.
+
 ## Quick Start
 
 1.  Open terminal in this directory
@@ -267,12 +279,9 @@ kaleidoscope/
 └── .venv/                     # Python environment
 ```
 
-## Environment Variables (Optional)
+## Environment Variables
 
-  * `E8_LLM_PROVIDER`: openai, ollama, google (default: openai)
-  * `E8_LLM_MODEL`: Model name (default: gpt-4)
-  * `E8_WEB_PORT`: Web interface port (default: 8080)
-  * `OPENAI_API_KEY`: Your OpenAI API key
+See `docs/env.md` for the up-to-date list of runtime environment knobs, defaults, and example exports.
 
 ## Notes
 
