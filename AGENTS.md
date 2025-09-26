@@ -84,3 +84,21 @@ Add to this list as discoveries happen. The goal is to keep every agent aligned 
 ### Separation of Concerns
 - You (human): chat-only intent, pick NOW item, approve acceptance, steer priorities.
 - Me (agent): do all file ops, hashing, snapshots, runs, verification, and archival; enforce the gates above.
+
+### Human-Run Mode (Two-Key)
+When enabled, no inner execution happens without the human. The flow uses explicit approvals:
+
+- Approvals (in chat):
+  - `approve-plan: <prompt-id>` — approve the drafted prompt and plan-only stage.
+  - `approve-run: <prompt-id>` — authorize execution; human runs the command below.
+  - `accept: <prompt-id>` — accept the change after verification and PR.
+
+- Flow:
+  1) Plan-only: agent drafts a NOW prompt and session log stub, computes `prompt_sha256`, and prints the exact run command.
+  2) Human-run: human executes the command in a shell:
+     - `cat <prompt> | codex exec -m gpt-5-codex -C . --full-auto`
+  3) Verify + PR: agent runs smoke, updates the session log (Verification), archives the prompt to `done/`, opens a PR, and waits for `accept`.
+
+- Branch naming: include the prompt id, e.g., `feat/BL-YYYYMMDD-slug` or `chore/<prompt-id>-slug`.
+- PR template: fill the Protocol Checklist in `.github/PULL_REQUEST_TEMPLATE.md` (session log path + `prompt_sha256`).
+- No direct pushes to `main`; always open a PR.
