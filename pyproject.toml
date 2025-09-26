@@ -42,7 +42,10 @@ dev = [
 ]
 
 [tool.setuptools]
-packages = []
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["e8*"]
 
 [tool.ruff]
 line-length = 100
